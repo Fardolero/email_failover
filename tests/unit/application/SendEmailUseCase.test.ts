@@ -1,6 +1,10 @@
 import { SendEmailUseCase } from '../../../src/application/use-cases/SendEmailUseCase';
 import { SendEmailCommand } from '../../../src/application/dto/SendEmailCommand';
-import { AllProvidersFailedError, DuplicateIdempotencyKeyConflictError } from '../../../src/domain/errors/DomainErrors';
+import {
+  AllProvidersFailedError,
+  DuplicateIdempotencyKeyConflictError,
+  IdempotencyKeyInFlightError,
+} from '../../../src/domain/errors/DomainErrors';
 import { InvalidEmailAddressError, InvalidEmailMessageError } from '../../../src/domain/errors/DomainErrors';
 import { FakeEmailProvider } from '../../doubles/FakeEmailProvider';
 import { createTestRepository } from '../../doubles/InMemoryEmailSendRepositoryTestFactory';
@@ -171,6 +175,131 @@ describe('SendEmailUseCase', () => {
           baseCommand({ idempotencyKey: 'idem-999', subject: 'Asunto distinto' }),
         ),
       ).rejects.toThrow(DuplicateIdempotencyKeyConflictError);
+    });
+
+    it('rechaza una segunda peticion CONCURRENTE con la misma Idempotency-Key mientras la primera todavia esta en curso (evita doble envio)', async () => {
+      // El proveedor tarda "un rato" en responder, para poder disparar la
+      // segunda peticion mientras la primera todavia no termino: sin la
+      // reserva PENDING, ambas pasarian el chequeo de "no existe" y el
+      // correo se enviaria dos veces.
+      const primary = new FakeEmailProvider('mailgun', { type: 'success' }, 30);
+      const repository = createTestRepository();
+      const useCase = new SendEmailUseCase({
+        providers: [primary],
+        repository,
+        logger: silentLogger,
+        retryConfig: fastRetryConfig,
+      });
+
+      const command = baseCommand({ idempotencyKey: 'idem-concurrente' });
+      const firstPromise = useCase.execute(command);
+      // Se cede el control del event loop para asegurar que la primera
+      // peticion ya alcanzo a reservar la clave (PENDING) antes de lanzar
+      // la segunda.
+      await new Promise((resolve) => setImmediate(resolve));
+      const secondPromise = useCase.execute({ ...command, requestId: 'req-concurrente-2' });
+
+      await expect(secondPromise).rejects.toThrow(IdempotencyKeyInFlightError);
+      await expect(firstPromise).resolves.toMatchObject({ status: 'SENT' });
+      expect(primary.callCount).toBe(1);
+    });
+
+    it('permite reintentar con la misma Idempotency-Key si el intento anterior fallo (no quedo un envio duplicado bloqueado para siempre)', async () => {
+      const primary = new FakeEmailProvider('mailgun', { type: 'transient-failure' });
+      const repository = createTestRepository();
+      const useCase = new SendEmailUseCase({
+        providers: [primary],
+        repository,
+        logger: silentLogger,
+        retryConfig: fastRetryConfig,
+      });
+
+      const command = baseCommand({ idempotencyKey: 'idem-retry-tras-fallo' });
+      await expect(useCase.execute(command)).rejects.toThrow(AllProvidersFailedError);
+
+      // Ahora el proveedor "se recupera" y el cliente reintenta con la
+      // misma clave: no deberia quedar bloqueado por el fallo anterior.
+      const secondary = new FakeEmailProvider('mailgun-recuperado', { type: 'success' });
+      const useCaseRetry = new SendEmailUseCase({
+        providers: [secondary],
+        repository,
+        logger: silentLogger,
+        retryConfig: fastRetryConfig,
+      });
+      const result = await useCaseRetry.execute({ ...command, requestId: 'req-retry' });
+
+      expect(result.status).toBe('SENT');
+      expect(result.idempotentReplay).toBe(false);
+    });
+  });
+
+  describe('circuit breaker por proveedor', () => {
+    function fakeClock(startMs: number) {
+      let current = startMs;
+      return { now: () => current, advance: (ms: number) => (current += ms) };
+    }
+
+    it('tras varios fallos consecutivos EN PETICIONES DISTINTAS, abre el circuito y deja de contactar a ese proveedor (failover inmediato)', async () => {
+      const primary = new FakeEmailProvider('mailgun', { type: 'transient-failure' });
+      const secondary = new FakeEmailProvider('sendgrid', { type: 'success' });
+      const clock = fakeClock(0);
+      const useCase = new SendEmailUseCase({
+        providers: [primary, secondary],
+        repository: createTestRepository(),
+        logger: silentLogger,
+        retryConfig: { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 2 },
+        circuitBreakerConfig: { failureThreshold: 2, openDurationMs: 10_000 },
+        clock: clock.now,
+      });
+
+      // 2 peticiones separadas contra un primario siempre caido: alcanza
+      // el failureThreshold (2) y el circuito de "mailgun" se abre.
+      await useCase.execute(baseCommand({ requestId: 'r1' }));
+      await useCase.execute(baseCommand({ requestId: 'r2' }));
+      expect(primary.callCount).toBe(2);
+
+      // Una tercera peticion: como el circuito de "mailgun" ya esta
+      // abierto, NO deberia ni siquiera intentar contactarlo.
+      const result = await useCase.execute(baseCommand({ requestId: 'r3' }));
+
+      expect(primary.callCount).toBe(2); // sigue en 2: no se lo volvio a llamar
+      expect(result.providerName).toBe('sendgrid');
+      expect(
+        result.attempts.find((a) => a.providerName === 'mailgun')?.errorMessage,
+      ).toMatch(/circuit breaker abierto/i);
+    });
+
+    it('pasado openDurationMs, vuelve a intentar contra el proveedor (half-open) y si responde OK cierra el circuito', async () => {
+      const primary = new FakeEmailProvider('mailgun', {
+        type: 'fail-n-times-then-succeed',
+        failures: 2,
+      });
+      const clock = fakeClock(0);
+      const useCase = new SendEmailUseCase({
+        providers: [primary],
+        repository: createTestRepository(),
+        logger: silentLogger,
+        retryConfig: { maxRetries: 0, baseDelayMs: 1, maxDelayMs: 2 },
+        circuitBreakerConfig: { failureThreshold: 2, openDurationMs: 10_000 },
+        clock: clock.now,
+      });
+
+      await expect(useCase.execute(baseCommand({ requestId: 'r1' }))).rejects.toThrow();
+      await expect(useCase.execute(baseCommand({ requestId: 'r2' }))).rejects.toThrow();
+      expect(primary.callCount).toBe(2);
+
+      // Con el circuito abierto, una peticion inmediata no debe ni
+      // siquiera contactar al proveedor.
+      await expect(useCase.execute(baseCommand({ requestId: 'r3' }))).rejects.toThrow();
+      expect(primary.callCount).toBe(2);
+
+      // Pasa el tiempo de espera: la siguiente peticion SI debe intentar
+      // de nuevo (half-open), y esta vez el proveedor ya se recupero.
+      clock.advance(10_001);
+      const result = await useCase.execute(baseCommand({ requestId: 'r4' }));
+
+      expect(primary.callCount).toBe(3);
+      expect(result.status).toBe('SENT');
     });
   });
 });
