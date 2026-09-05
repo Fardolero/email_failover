@@ -8,6 +8,7 @@ import { EmailProviderPort } from '../../domain/ports/EmailProviderPort';
 import { EmailSendRepository } from '../../application/ports/EmailSendRepository';
 import { Logger } from '../../application/ports/Logger';
 import { RetryConfig } from '../../application/services/RetryPolicy';
+import { CircuitBreakerConfig } from '../../application/services/CircuitBreaker';
 import { SendEmailUseCase } from '../../application/use-cases/SendEmailUseCase';
 import { EmailController } from './controllers/EmailController';
 import { buildEmailRoutes } from './routes/emailRoutes';
@@ -20,6 +21,7 @@ export interface BuildAppDeps {
   repository: EmailSendRepository;
   logger: Logger & { child?: (bindings: Record<string, unknown>) => Logger };
   retryConfig: RetryConfig;
+  circuitBreakerConfig?: CircuitBreakerConfig;
 }
 
 /**
@@ -64,6 +66,7 @@ export function buildApp(deps: BuildAppDeps): Express {
     repository: deps.repository,
     logger: deps.logger,
     retryConfig: deps.retryConfig,
+    circuitBreakerConfig: deps.circuitBreakerConfig,
   });
   const controller = new EmailController(useCase, deps.repository);
 
