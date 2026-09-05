@@ -1,0 +1,262 @@
+openapi: 3.0.3
+info:
+  title: Email Failover Service API
+  description: >
+    API REST para el envio resiliente de correos electronicos (recibos,
+    alertas de seguridad, validaciones) en una plataforma de movilidad a
+    gran escala. Implementa una estrategia de failover automatico entre
+    multiples proveedores de email (Mailgun, SendGrid, Postmark, ...) con
+    reintentos y backoff exponencial por proveedor.
+  version: "1.0.0"
+  contact:
+    name: Email Failover Service
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Entorno local
+
+tags:
+  - name: Emails
+    description: Envio y consulta de estado de correos
+  - name: Salud
+    description: Endpoints de health check
+
+paths:
+  /emails:
+    post:
+      tags: [Emails]
+      summary: Envia un correo, con failover automatico entre proveedores
+      description: >
+        Intenta enviar el mensaje a traves del proveedor primario
+        configurado. Si falla con un error transitorio (timeout, 5xx,
+        rate limiting), reintenta con backoff exponencial hasta agotar
+        `MAX_RETRIES_PER_PROVIDER`; si aun asi falla, conmuta
+        automaticamente al siguiente proveedor de la cadena, y asi
+        sucesivamente. Solo responde con error si TODOS los proveedores
+        configurados fallaron.
+      operationId: sendEmail
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema:
+            type: string
+          description: >
+            Clave opcional provista por el cliente para hacer la peticion
+            idempotente: reintentar la misma peticion con la misma clave
+            devuelve el resultado original sin volver a enviar el correo.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendEmailRequest'
+            examples:
+              simple:
+                summary: Email simple en texto plano
+                value:
+                  from: no-reply@mimovilidad.com
+                  to: ["usuario@example.com"]
+                  subject: "Tu recibo de viaje #4821"
+                  textBody: "Gracias por viajar con nosotros. Total: $1250."
+      responses:
+        '200':
+          description: El correo fue enviado exitosamente (por el primario o por failover).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendEmailResponse'
+        '400':
+          description: Payload invalido (campos faltantes o mal formados).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: >
+            La Idempotency-Key ya fue usada previamente con un payload
+            distinto.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: >
+            Todos los proveedores de email configurados fallaron tras
+            agotar sus reintentos. Incluye el detalle de cada intento.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /emails/{id}:
+    get:
+      tags: [Emails]
+      summary: Consulta el estado de un envio previamente registrado
+      operationId: getEmailStatus
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+          description: requestId devuelto al momento del envio
+      responses:
+        '200':
+          description: Registro del envio encontrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmailSendRecord'
+        '404':
+          description: No existe un envio con ese id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /health:
+    get:
+      tags: [Salud]
+      summary: Health check del servicio
+      operationId: getHealth
+      responses:
+        '200':
+          description: El servicio esta operativo.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: UP
+                  timestamp:
+                    type: string
+                    format: date-time
+
+components:
+  schemas:
+    Attachment:
+      type: object
+      required: [filename, contentType, contentBase64]
+      properties:
+        filename:
+          type: string
+          example: recibo.pdf
+        contentType:
+          type: string
+          example: application/pdf
+        contentBase64:
+          type: string
+          description: Contenido del adjunto codificado en base64.
+
+    SendEmailRequest:
+      type: object
+      required: [from, to, subject]
+      properties:
+        from:
+          type: string
+          format: email
+          example: no-reply@mimovilidad.com
+        to:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: email
+          example: ["usuario@example.com"]
+        cc:
+          type: array
+          items:
+            type: string
+            format: email
+        subject:
+          type: string
+          example: "Tu recibo de viaje #4821"
+        textBody:
+          type: string
+          description: Cuerpo en texto plano. Requerido si no se envia htmlBody.
+        htmlBody:
+          type: string
+          description: Cuerpo en HTML. Requerido si no se envia textBody.
+        replyTo:
+          type: string
+          format: email
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Attachment'
+
+    ProviderAttempt:
+      type: object
+      properties:
+        providerName:
+          type: string
+          example: mailgun
+        attemptNumber:
+          type: integer
+          example: 1
+        succeeded:
+          type: boolean
+        errorMessage:
+          type: string
+          nullable: true
+        durationMs:
+          type: integer
+
+    SendEmailResponse:
+      type: object
+      properties:
+        requestId:
+          type: string
+        status:
+          type: string
+          enum: [SENT]
+        providerName:
+          type: string
+          example: mailgun
+        providerMessageId:
+          type: string
+        idempotentReplay:
+          type: boolean
+          description: true si esta respuesta proviene de una Idempotency-Key ya procesada.
+        attempts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderAttempt'
+
+    EmailSendRecord:
+      type: object
+      properties:
+        requestId:
+          type: string
+        status:
+          type: string
+          enum: [SENT, FAILED]
+        providerName:
+          type: string
+        providerMessageId:
+          type: string
+        attempts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderAttempt'
+        createdAt:
+          type: string
+          format: date-time
+
+    ErrorResponse:
+      type: object
+      properties:
+        requestId:
+          type: string
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: ALL_PROVIDERS_FAILED
+            message:
+              type: string
+            details:
+              type: object

@@ -1,0 +1,19 @@
+services:
+  email-failover-service:
+    build: .
+    ports:
+      - '3000:3000'
+    environment:
+      PORT: 3000
+      LOG_LEVEL: info
+      PROVIDER_ORDER: mailgun,sendgrid,postmark
+      MAILGUN_MODE: healthy
+      SENDGRID_MODE: healthy
+      POSTMARK_MODE: healthy
+      MAILGUN_FLAKY_FAILURES: 2
+      SENDGRID_FLAKY_FAILURES: 2
+      POSTMARK_FLAKY_FAILURES: 2
+      PROVIDER_SIMULATED_LATENCY_MS: 50
+      MAX_RETRIES_PER_PROVIDER: 2
+      RETRY_BASE_DELAY_MS: 100
+      RETRY_MAX_DELAY_MS: 2000
