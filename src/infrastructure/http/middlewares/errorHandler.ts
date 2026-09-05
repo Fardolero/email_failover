@@ -2,6 +2,7 @@ import { NextFunction, Request, Response } from 'express';
 import {
   AllProvidersFailedError,
   DuplicateIdempotencyKeyConflictError,
+  IdempotencyKeyInFlightError,
   InvalidEmailAddressError,
   InvalidEmailMessageError,
 } from '../../../domain/errors/DomainErrors';
@@ -47,6 +48,17 @@ export function buildErrorHandler(logger: Logger) {
         requestId,
         error: { code: 'IDEMPOTENCY_KEY_CONFLICT', message: err.message },
       };
+      res.status(409).json(body);
+      return;
+    }
+
+    if (err instanceof IdempotencyKeyInFlightError) {
+      const body: ErrorBody = {
+        requestId,
+        error: { code: 'IDEMPOTENCY_KEY_IN_FLIGHT', message: err.message },
+      };
+      // 409 Conflict: hay otra peticion con la misma Idempotency-Key en
+      // curso en este momento; el cliente deberia reintentar mas tarde.
       res.status(409).json(body);
       return;
     }
