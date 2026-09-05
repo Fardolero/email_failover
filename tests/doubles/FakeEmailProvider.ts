@@ -22,11 +22,17 @@ export class FakeEmailProvider implements EmailProviderPort {
   constructor(
     public readonly name: string,
     private readonly behavior: FakeBehavior,
+    /** Delay artificial antes de resolver, util para simular concurrencia en tests. */
+    private readonly delayMs: number = 0,
   ) {}
 
   async send(message: EmailMessage): Promise<ProviderSendResult> {
     this.callCount += 1;
     this.receivedMessages.push(message);
+
+    if (this.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    }
 
     switch (this.behavior.type) {
       case 'success':
