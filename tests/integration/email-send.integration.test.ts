@@ -122,6 +122,29 @@ describe('POST /api/v1/emails', () => {
     expect(provider.callCount).toBe(1);
   });
 
+  it('409: dos peticiones CONCURRENTES con la misma Idempotency-Key no duplican el envio', async () => {
+    const provider = new FakeEmailProvider('mailgun', { type: 'success' }, 30);
+    const app = buildTestApp([provider]);
+    const payload = validPayload();
+
+    const [first, second] = await Promise.all([
+      request(app).post('/api/v1/emails').set('Idempotency-Key', 'concurrent-key').send(payload),
+      new Promise<request.Response>((resolve) => {
+        setTimeout(() => {
+          request(app)
+            .post('/api/v1/emails')
+            .set('Idempotency-Key', 'concurrent-key')
+            .send(payload)
+            .then(resolve);
+        }, 5);
+      }),
+    ]);
+
+    const statuses = [first.status, second.status].sort();
+    expect(statuses).toEqual([200, 409]);
+    expect(provider.callCount).toBe(1);
+  });
+
   it('409: rechaza reusar una Idempotency-Key con un payload distinto', async () => {
     const provider = new FakeEmailProvider('mailgun', { type: 'success' });
     const app = buildTestApp([provider]);
