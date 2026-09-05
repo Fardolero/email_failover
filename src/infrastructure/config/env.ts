@@ -26,6 +26,10 @@ export interface AppEnv {
     baseDelayMs: number;
     maxDelayMs: number;
   };
+  circuitBreaker: {
+    failureThreshold: number;
+    openDurationMs: number;
+  };
   providers: {
     mailgun: { mode: MockProviderMode; flakyFailuresBeforeSuccess: number };
     sendgrid: { mode: MockProviderMode; flakyFailuresBeforeSuccess: number };
@@ -54,6 +58,10 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
       maxRetries: optionalInt(source.MAX_RETRIES_PER_PROVIDER, 2),
       baseDelayMs: optionalInt(source.RETRY_BASE_DELAY_MS, 100),
       maxDelayMs: optionalInt(source.RETRY_MAX_DELAY_MS, 2000),
+    },
+    circuitBreaker: {
+      failureThreshold: optionalInt(source.CIRCUIT_BREAKER_FAILURE_THRESHOLD, 5),
+      openDurationMs: optionalInt(source.CIRCUIT_BREAKER_OPEN_DURATION_MS, 30_000),
     },
     providers: {
       mailgun: {
