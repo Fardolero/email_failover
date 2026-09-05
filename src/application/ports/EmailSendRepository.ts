@@ -1,6 +1,6 @@
 import { ProviderAttempt } from '../../domain/errors/DomainErrors';
 
-export type EmailSendStatus = 'SENT' | 'FAILED';
+export type EmailSendStatus = 'PENDING' | 'SENT' | 'FAILED';
 
 export interface EmailSendRecord {
   requestId: string;
@@ -18,7 +18,14 @@ export interface EmailSendRecord {
  * Puerto de persistencia para el historial de envios. Se usa para:
  *  - soportar idempotencia (Idempotency-Key): si el cliente reintenta la
  *    misma peticion, se devuelve el resultado ya obtenido en vez de
- *    volver a disparar el envio contra los proveedores.
+ *    volver a disparar el envio contra los proveedores. El estado
+ *    intermedio `PENDING` se guarda ANTES de contactar a los proveedores
+ *    para "reservar" la clave: si una segunda peticion concurrente llega
+ *    con la misma Idempotency-Key mientras la primera todavia esta en
+ *    curso, la encuentra en `PENDING` y no dispara un segundo envio real
+ *    (ver SendEmailUseCase). Sin esta reserva, dos peticiones concurrentes
+ *    con la misma clave podrian pasar ambas el chequeo de "no existe" y
+ *    terminar enviando el correo dos veces.
  *  - exponer un endpoint de consulta de estado (`GET /emails/:id`).
  *
  * La implementacion de referencia (InMemoryEmailSendRepository) guarda todo
