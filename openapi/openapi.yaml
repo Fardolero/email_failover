@@ -73,8 +73,11 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
           description: >
-            La Idempotency-Key ya fue usada previamente con un payload
-            distinto.
+            Conflicto de idempotencia: la Idempotency-Key ya fue usada
+            previamente con un payload distinto (`IDEMPOTENCY_KEY_CONFLICT`),
+            o hay otra peticion con la misma clave todavia en curso
+            (`IDEMPOTENCY_KEY_IN_FLIGHT`) — en este ultimo caso, reintentar
+            mas tarde.
           content:
             application/json:
               schema:
@@ -232,7 +235,10 @@ components:
           type: string
         status:
           type: string
-          enum: [SENT, FAILED]
+          enum: [PENDING, SENT, FAILED]
+          description: >
+            PENDING significa que el envio esta en curso (reservado por una
+            Idempotency-Key mientras se contacta a los proveedores).
         providerName:
           type: string
         providerMessageId:
