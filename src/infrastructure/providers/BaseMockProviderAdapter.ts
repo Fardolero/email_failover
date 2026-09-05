@@ -59,14 +59,25 @@ export abstract class BaseMockProviderAdapter implements EmailProviderPort {
       );
     }
 
-    if (
-      this.config.mode === 'flaky' &&
-      attemptNumberForThisProvider <= this.config.flakyFailuresBeforeSuccess
-    ) {
-      throw new TransientProviderError(
-        this.name,
-        `[mock] ${this.name} fallo transitorio simulado (intento ${attemptNumberForThisProvider}/${this.config.flakyFailuresBeforeSuccess} antes de recuperarse)`,
-      );
+    if (this.config.mode === 'flaky') {
+      // El contador de llamadas es de instancia (vive mientras el proceso
+      // este arriba), no "por mensaje": si solo comparara
+      // attemptNumberForThisProvider contra flakyFailuresBeforeSuccess de
+      // forma directa, el proveedor se "curaria" para siempre despues del
+      // primer email que lo agotara, y todos los envios posteriores lo
+      // verian permanentemente sano (un demo poco realista y facil de
+      // confundir con un bug de la logica de reintentos). En cambio, se
+      // repite el patron fallar-N-veces/responder-OK en ciclos, para que
+      // el modo "flaky" siga siendo observable en cualquier envio
+      // posterior, no solo en el primero.
+      const cycleLength = this.config.flakyFailuresBeforeSuccess + 1;
+      const positionInCycle = ((attemptNumberForThisProvider - 1) % cycleLength) + 1;
+      if (positionInCycle <= this.config.flakyFailuresBeforeSuccess) {
+        throw new TransientProviderError(
+          this.name,
+          `[mock] ${this.name} fallo transitorio simulado (intento ${positionInCycle}/${this.config.flakyFailuresBeforeSuccess} del ciclo actual antes de recuperarse)`,
+        );
+      }
     }
 
     return {
