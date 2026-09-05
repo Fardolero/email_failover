@@ -19,7 +19,11 @@ export function createProductionApp(): Express {
   const repository = new InMemoryEmailSendRepository();
 
   logger.info(
-    { providerOrder: providers.map((p) => p.name), retry: env.retry },
+    {
+      providerOrder: providers.map((p) => p.name),
+      retry: env.retry,
+      circuitBreaker: env.circuitBreaker,
+    },
     'Cadena de failover configurada',
   );
 
@@ -28,6 +32,7 @@ export function createProductionApp(): Express {
     repository,
     logger,
     retryConfig: env.retry,
+    circuitBreakerConfig: env.circuitBreaker,
   });
 }
 
