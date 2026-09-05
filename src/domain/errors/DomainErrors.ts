@@ -55,3 +55,18 @@ export class DuplicateIdempotencyKeyConflictError extends Error {
     this.name = 'DuplicateIdempotencyKeyConflictError';
   }
 }
+
+/**
+ * Se lanza cuando una peticion concurrente con la misma Idempotency-Key
+ * llega mientras la primera todavia esta en curso (ni terminada con
+ * exito ni fallada). Evita que dos peticiones simultaneas con la misma
+ * clave terminen enviando el correo dos veces.
+ */
+export class IdempotencyKeyInFlightError extends Error {
+  constructor(public readonly idempotencyKey: string) {
+    super(
+      `Ya hay un envio en curso para la Idempotency-Key "${idempotencyKey}". Reintente en unos segundos.`,
+    );
+    this.name = 'IdempotencyKeyInFlightError';
+  }
+}
