@@ -1,6 +1,6 @@
 # Email Failover Service
 
-API REST para el envío resiliente de correos electrónicos (recibos, alertas de seguridad, validaciones) en una plataforma de movilidad a gran escala. Implementa una **estrategia de failover automático** entre múltiples proveedores de email (Mailgun, SendGrid, Postmark), con reintentos y backoff exponencial por proveedor, siguiendo **Clean / Hexagonal Architecture**.
+API REST para el envío resiliente de correos electrónicos (recibos, alertas de seguridad, validaciones) en una plataforma de movilidad a gran escala. Implementa una **estrategia de failover automático** entre múltiples proveedores de email (Mailgun, SendGrid, Postmark), con reintentos y backoff exponencial por proveedor, un **circuit breaker** que deja de contactar a un proveedor caído entre peticiones, e **idempotencia** segura ante reintentos (incluso concurrentes) del cliente — todo siguiendo **Clean / Hexagonal Architecture**.
 
 > Ninguno de los proveedores llama a un servicio real: son adaptadores *mock* configurables por variables de entorno, tal como permite el enunciado. La arquitectura está diseñada para que reemplazarlos por clientes reales (SDK de Mailgun, SendGrid, Postmark) sea un cambio localizado a `src/infrastructure/providers`, sin tocar dominio, aplicación ni la capa HTTP.
 
@@ -63,14 +63,16 @@ Esto es lo que permite que `SendEmailUseCase` (el corazón del negocio) se teste
 
 `SendEmailUseCase` recibe una lista ordenada de `EmailProviderPort` (la "cadena de failover", configurada vía `PROVIDER_ORDER`). Para cada envío:
 
-1. **Valida** el mensaje contra las reglas de dominio (direcciones de email válidas, al menos un destinatario, asunto y cuerpo presentes). Si es inválido, se responde `400` sin contactar a ningún proveedor.
-2. **Idempotencia** (opcional): si la petición trae un header `Idempotency-Key` ya usado con el mismo payload, se devuelve el resultado ya obtenido sin reenviar el correo. Si se reusa la misma clave con un payload distinto, se responde `409`.
+1. **Valida** el mensaje contra las reglas de dominio (direcciones de email válidas, al menos un destinatario, asunto y cuerpo presentes). Si es inválido, se responde `400` sin contactar a ningún proveedor ni consumir la `Idempotency-Key`.
+2. **Idempotencia** (opcional, header `Idempotency-Key`): si ya existe un envío **`SENT`** con el mismo payload, se devuelve ese resultado cacheado sin reenviar el correo (`409` si el payload es distinto). Si ya hay un envío con esa misma clave **en curso** (`PENDING`) — por ejemplo, dos peticiones concurrentes del cliente con la misma clave — la segunda se rechaza con `409` en vez de disparar un segundo envío real: la clave se "reserva" (se guarda en estado `PENDING`) *antes* de contactar a cualquier proveedor, precisamente para cerrar esa ventana de carrera.
 3. Para cada proveedor de la cadena, en orden:
-   - Se invoca `provider.send(message)`.
+   - Si su **circuit breaker** está abierto (viene fallando de forma sostenida en peticiones anteriores), se lo salta sin contactarlo y se pasa directo al siguiente.
+   - Si no, se invoca `provider.send(message)`.
    - Si falla con un **`TransientProviderError`** (timeout, 5xx, rate limiting), se reintenta con **backoff exponencial + jitter completo** hasta `MAX_RETRIES_PER_PROVIDER` veces.
    - Si falla con un **`PermanentProviderError`** (ese proveedor rechazó el mensaje de forma definitiva, p. ej. credenciales inválidas), **no se reintenta contra ese proveedor**, pero sí se continúa con el siguiente de la cadena.
-   - Si el proveedor tiene éxito (en el primer intento o tras reintentos), el envío termina ahí: **no se contacta a los proveedores restantes**.
-4. Si **todos** los proveedores de la cadena fallan, se lanza `AllProvidersFailedError` con el detalle de cada intento, que la capa HTTP traduce a `502 Bad Gateway`.
+   - Si el proveedor tiene éxito (en el primer intento o tras reintentos), el envío termina ahí: **no se contacta a los proveedores restantes**, y su circuit breaker se cierra.
+   - Si agota los reintentos sin éxito, su circuit breaker registra el fallo (y se abre si acumuló `CIRCUIT_BREAKER_FAILURE_THRESHOLD` fallos consecutivos **entre peticiones**, no solo dentro de una).
+4. Si **todos** los proveedores de la cadena fallan (o tienen el circuito abierto), se lanza `AllProvidersFailedError` con el detalle de cada intento, que la capa HTTP traduce a `502 Bad Gateway`.
 
 Cada intento (proveedor, número de intento, éxito/error, duración) queda registrado y se devuelve en la respuesta (`attempts`), tanto en el caso de éxito como de error, para observabilidad y debugging.
 
@@ -100,6 +102,8 @@ flowchart TD
 - **`zod` para validación de forma del payload HTTP, dominio para validación semántica**: la validación de "¿el JSON tiene la forma correcta?" es responsabilidad de la capa HTTP (mensajes de error por campo, 400 inmediato); la validación de "¿esta dirección de email es válida según las reglas de negocio?" vive en el dominio (`EmailAddress`), que es la única fuente de verdad y se reutiliza en cualquier otro punto de entrada futuro (cola de mensajes, CLI, etc.), no solo HTTP.
 - **Sin framework de DI**: la inyección de dependencias se resuelve con constructores explícitos y funciones factory (`container.ts`, `providerChain.ts`). Para el tamaño de este servicio, un framework como InversifyJS o tsyringe agregaría una capa de indirección (decoradores, contenedor mágico) sin beneficio real; el "composition root" manual es explícito y fácil de seguir.
 - **Sin base de datos externa**: se usa un repositorio in-memory detrás del puerto `EmailSendRepository` para no introducir una dependencia de infraestructura (Postgres/Redis) que el enunciado no pide y que complicaría "cómo correr el servicio localmente". La interfaz ya está preparada para ese reemplazo (ver [Escalabilidad](#escalabilidad-y-despliegue-en-producción)).
+- **Circuit breaker por proveedor** (`CircuitBreaker.ts`), independiente y complementario al retry: el retry protege UNA petición de un fallo puntual, pero si un proveedor está genuinamente caído durante varios minutos, sin un circuit breaker *cada petición nueva* pagaría igual el costo completo de reintentar contra él antes de recién ahí conmutar, degradando la latencia de todos los clientes durante toda la caída. El breaker recuerda el fallo *entre peticiones* y deja de intentar contra ese proveedor durante una ventana de tiempo (fail-fast), con un estado `HALF_OPEN` para probar la recuperación sin necesidad de un proceso externo de monitoreo.
+- **Reserva de la Idempotency-Key en dos fases (`PENDING` → `SENT`/`FAILED`)**: si el registro se guardara recién al terminar el envío, dos peticiones concurrentes con la misma clave pasarían ambas el chequeo de "¿ya existe?" mientras la primera todavía está en curso, y terminarían enviando el correo dos veces. Guardar un registro `PENDING` *antes* de contactar a los proveedores cierra esa ventana de carrera a costa de un único `save()` adicional.
 
 ## Cómo correr el servicio localmente
 
@@ -139,8 +143,10 @@ Ninguna de las variables `MAILGUN_MODE` / `SENDGRID_MODE` / `POSTMARK_MODE` requ
 | Valor     | Comportamiento simulado                                                             |
 |-----------|---------------------------------------------------------------------------------------|
 | `healthy` | Responde OK siempre (con la latencia simulada de `PROVIDER_SIMULATED_LATENCY_MS`).     |
-| `flaky`   | Falla de forma transitoria las primeras `*_FLAKY_FAILURES` veces y luego responde OK.  |
+| `flaky`   | Falla de forma transitoria las primeras `*_FLAKY_FAILURES` llamadas de cada ciclo y luego responde OK una vez, repitiendo el ciclo indefinidamente (para poder observar el patrón en cualquier envío, no solo en el primero). |
 | `down`    | Falla siempre con un error transitorio (simula un 503 / timeout).                      |
+
+Para ver el **circuit breaker** en acción: con `MAILGUN_MODE=down` y `CIRCUIT_BREAKER_FAILURE_THRESHOLD=2` (por defecto es 5), las primeras dos peticiones hacen failover a SendGrid tras agotar los reintentos de Mailgun; a partir de la tercera, la respuesta muestra en `attempts` que Mailgun ni siquiera fue contactado ("Circuit breaker abierto...").
 
 Ejemplo — forzar que Mailgun esté caído y verificar el failover automático a SendGrid:
 
@@ -216,8 +222,8 @@ npm test              # unit + integración
 npm run test:coverage # con reporte de cobertura
 ```
 
-- **Unitarios** (`tests/unit/`): `EmailAddress`, `EmailMessage` (reglas de dominio), `RetryPolicy` (backoff y clasificación de errores), y `SendEmailUseCase` (la lógica de negocio central), usando **test doubles** (`FakeEmailProvider`) que no hacen I/O real. Cubren: éxito directo, recuperación solo con reintentos (sin failover), failover a un segundo y hasta un tercer proveedor, fallo total (`AllProvidersFailedError`), rechazo de payloads inválidos sin contactar proveedores, e idempotencia (replay y conflicto).
-- **Integración** (`tests/integration/`): levantan la aplicación Express completa (`buildApp`) inyectando `FakeEmailProvider`s vía `supertest`, sin mockear módulos ni depender de variables de entorno. Cubren el escenario de éxito, el escenario de failover, el `502` cuando todos fallan, validaciones `400`, idempotencia (`200` en replay, `409` en conflicto), consulta de estado y health check.
+- **Unitarios** (`tests/unit/`): `EmailAddress`, `EmailMessage` (reglas de dominio), `RetryPolicy` (backoff y clasificación de errores), `CircuitBreaker` (transiciones CLOSED/OPEN/HALF_OPEN con reloj inyectado), y `SendEmailUseCase` (la lógica de negocio central), usando **test doubles** (`FakeEmailProvider`) que no hacen I/O real. Cubren: éxito directo, recuperación solo con reintentos (sin failover), failover a un segundo y hasta un tercer proveedor, fallo total (`AllProvidersFailedError`), rechazo de payloads inválidos sin contactar proveedores, idempotencia (replay, conflicto, **reserva concurrente** y reintento tras fallo previo), y apertura/recuperación del circuit breaker a través de múltiples peticiones.
+- **Integración** (`tests/integration/`): levantan la aplicación Express completa (`buildApp`) inyectando `FakeEmailProvider`s vía `supertest`, sin mockear módulos ni depender de variables de entorno. Cubren el escenario de éxito, el escenario de failover, el `502` cuando todos fallan, validaciones `400`, idempotencia (`200` en replay, `409` en conflicto de payload y **`409` ante dos peticiones concurrentes con la misma clave**), consulta de estado y health check.
 
 ## Observabilidad
 
@@ -237,16 +243,16 @@ Esto es una aplicación directa de **Open/Closed** (SOLID): el sistema está abi
 
 ## Escalabilidad y despliegue en producción
 
-- El servicio es **stateless a nivel de proceso** salvo por el repositorio de idempotencia/estado, que vive detrás de la interfaz `EmailSendRepository`. Para correr múltiples instancias detrás de un load balancer (indispensable en una plataforma de movilidad a gran escala), esa interfaz se implementaría contra **Redis** (con TTL sobre las claves de idempotencia) o una tabla compartida, sin cambiar el caso de uso ni la capa HTTP.
+- El servicio es **stateless a nivel de proceso** salvo por el repositorio de idempotencia/estado, que vive detrás de la interfaz `EmailSendRepository`, y por el estado del **circuit breaker** de cada proveedor (en memoria, dentro de `SendEmailUseCase`). Para correr múltiples instancias detrás de un load balancer (indispensable en una plataforma de movilidad a gran escala), el repositorio se implementaría contra **Redis** (con TTL sobre las claves de idempotencia) o una tabla compartida, sin cambiar el caso de uso ni la capa HTTP; el estado del circuit breaker, al ser una señal de salud aproximada y de corta vida, puede seguir siendo local a cada instancia (cada una "descubre" la caída del proveedor en, a lo sumo, `CIRCUIT_BREAKER_FAILURE_THRESHOLD` peticiones propias) o centralizarse en Redis si se quiere que todas las instancias reaccionen al unísono.
 - El `Dockerfile` (multi-stage) produce una imagen liviana lista para un orquestador (Kubernetes, ECS, Nomad); `docker-compose.yml` sirve para levantar el servicio localmente con un solo comando.
 - Próximos pasos razonables antes de un `PROVIDER_ORDER` con credenciales reales en producción:
-  - **Circuit breaker por proveedor** (además del retry): si un proveedor viene fallando de forma sostenida, dejar de intentarlo por una ventana de tiempo en vez de gastar el presupuesto de reintentos en cada request, reduciendo la latencia percibida por el cliente ante una caída prolongada.
   - **Cola asíncrona** (SQS/RabbitMQ) delante del envío si el volumen lo justifica, para desacoplar la latencia de la API del tiempo real de entrega y poder aplicar backpressure.
   - **Rate limiting** por cliente/API key en el borde de la API.
+  - **Métricas y tracing** (Prometheus/OpenTelemetry) sobre los mismos puntos de instrumentación que ya existen (ver [Observabilidad](#observabilidad)), incluyendo el estado de cada circuit breaker como gauge.
 
 ## Limitaciones conocidas y próximos pasos
 
 - Los adaptadores de proveedor son *mocks* configurables, no clientes reales; la integración con las APIs reales de Mailgun/SendGrid/Postmark (autenticación, mapeo exacto de códigos de error) queda como siguiente paso, aislado a `src/infrastructure/providers`.
-- No hay circuit breaker: ante un proveedor caído, cada request paga el costo de reintentar contra él antes de conmutar (mitigado por el backoff corto configurado por defecto). Es la extensión natural mencionada arriba.
-- El repositorio de idempotencia es in-memory (no compartido entre instancias); ver [Escalabilidad](#escalabilidad-y-despliegue-en-producción).
+- El repositorio de idempotencia/estado (incluida la reserva `PENDING` que evita doble envío ante peticiones concurrentes) es in-memory y no se comparte entre instancias del proceso; ver [Escalabilidad](#escalabilidad-y-despliegue-en-producción) para el camino a Redis/Postgres.
+- El estado del circuit breaker tampoco se comparte entre instancias (ver punto anterior): con múltiples réplicas detrás de un load balancer, cada una abre su propio circuito de forma independiente en base a sus propias peticiones.
 - No se implementó autenticación/autorización de la API en sí (fuera del alcance del enunciado), asumiendo que en producción el servicio corre detrás de un gateway/API key.
